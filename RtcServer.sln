@@ -1,0 +1,16 @@
+﻿
+Microsoft Visual Studio Solution File, Format Version 12.00
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "RtcServer", "RtcServer\RtcServer.csproj", "{70292319-38CB-499E-9D3B-CBFDD1B9818A}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|Any CPU = Debug|Any CPU
+		Release|Any CPU = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{70292319-38CB-499E-9D3B-CBFDD1B9818A}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{70292319-38CB-499E-9D3B-CBFDD1B9818A}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{70292319-38CB-499E-9D3B-CBFDD1B9818A}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{70292319-38CB-499E-9D3B-CBFDD1B9818A}.Release|Any CPU.Build.0 = Release|Any CPU
+	EndGlobalSection
+EndGlobal
