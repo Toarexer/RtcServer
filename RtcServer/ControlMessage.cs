@@ -1,7 +1,7 @@
 namespace RtcServer;
 
 /// <summary>Valid control message types.</summary>
-internal static class ControlMessage {
+public static class ControlMessage {
 	/// <summary>The control message type used for authentication.</summary>
 	public const byte Auth = 1;
 
@@ -10,7 +10,7 @@ internal static class ControlMessage {
 }
 
 /// <summary>The interface that has to be implemented by for control messages used by the <see cref="RtcClient"/>.</summary>
-internal interface IControlMessage {
+public interface IControlMessage {
 	/// <summary>The type of the control message.</summary>
 	public byte Type { get; }
 }
@@ -24,12 +24,12 @@ internal record InvalidMessage(byte Type) : IControlMessage;
 /// <param name="Password">The password to use for authentication.</param>
 /// <param name="Echo">Echo the data received back to the client or broadcast it to other clients.</param>
 // TODO: Use JWT authentication instead.
-internal record AuthenticationMessage(string Username, string Password, bool Echo) : IControlMessage {
+public record AuthenticationMessage(string Username, string Password, bool Echo) : IControlMessage {
 	public byte Type => ControlMessage.Auth;
 }
 
 /// <summary>An <see cref="IControlMessage"/> used for joining an <see cref="RtcClient"/> to a channel.</summary>
 /// <param name="ChannelId">The ID of the channel to join to.</param>
-internal record JoinChannelMessage(uint ChannelId) : IControlMessage {
+public record JoinChannelMessage(uint ChannelId) : IControlMessage {
 	public byte Type => ControlMessage.Chan;
 }

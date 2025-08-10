@@ -5,11 +5,26 @@ using System.Threading.Channels;
 
 namespace RtcServer;
 
+/// <summary>The base interface for RTC clients.</summary>
+public interface IRtcClient {
+	/// <summary>The ID of the client</summary>
+	uint Id { get; }
+
+	/// <summary>An optional alias for the client.</summary>
+	string? Alias { get; set; }
+
+	/// <summary>The remote address of the client.</summary>
+	string? Remote { get; }
+
+	/// <summary>The ID that will be assigned to the next client.</summary>
+	static abstract uint NextId { get; }
+}
+
 /// <summary>Handles a unidirectional control and a bidirectional data <see cref="QuicStream"/> for a <see cref="QuicConnection"/>.</summary>
 /// <remarks>All clients create a <see cref="CancellationTokenSource"/> that is linked to the provided <see cref="CancellationToken"/>, and a simple console logger.</remarks>
 [SupportedOSPlatform("linux")]
 [SupportedOSPlatform("windows")]
-internal sealed class RtcClient : IAsyncDisposable {
+public sealed class RtcClient : IAsyncDisposable, IRtcClient {
 	private record ControlMessageResult(IControlMessage? Message, bool Aborted);
 
 	private const int DataHeaderIdSize     = 4;
@@ -21,17 +36,14 @@ internal sealed class RtcClient : IAsyncDisposable {
 	/// <summary>https://www.rfc-editor.org/rfc/rfc6716</summary>
 	private const int MaxOpusPacketSize = 1275;
 
-	/// <summary>The ID that will be assigned to the next <see cref="RtcClient"/>.</summary>
-	public static uint NextId => _lastId + 1;
-
 	/// <summary>The <see cref="QuicConnection"/> the client was created with.</summary>
 	public readonly QuicConnection Connection;
 
-	/// <summary>The ID of the client</summary>
-	public readonly uint Id;
+	public uint Id { get; }
 
-	/// <summary>An optional alias for the client.</summary>
 	public string? Alias { get; set; }
+
+	public string Remote => Connection.RemoteEndPoint.ToString();
 
 	private readonly Channel<byte[]> _dataChannel = Channel.CreateBounded<byte[]>(new BoundedChannelOptions(DataChannelCapacity) { SingleReader = true });
 
@@ -52,6 +64,8 @@ internal sealed class RtcClient : IAsyncDisposable {
 	/// <summary>The last ID that was assigned to a <see cref="RtcClient"/>.</summary>
 	/// <remarks>Probably same to let if overflow since it will take a lot of time.</remarks>
 	private static uint _lastId = uint.MaxValue;
+
+	public static uint NextId => _lastId + 1;
 
 	/// <summary>Instantiates a new <see cref="RtcClient"/>.</summary>
 	/// <param name="connection">The <see cref="QuicConnection"/> to use.</param>
@@ -142,8 +156,8 @@ internal sealed class RtcClient : IAsyncDisposable {
 
 	/// <summary>Returns a task that starts handling the control stream in the background.</summary>
 	/// <param name="joinChannelMessageCallback">A delegate that will be called when a <see cref="JoinChannelMessage"/> is received. The requested channel id is passed to the delegate.</param>
-	public Task HandleControlStream(Action<uint>? joinChannelMessageCallback) {
-		joinChannelMessageCallback?.Invoke(0);
+	public Task HandleControlStream(Action<RtcClient, uint>? joinChannelMessageCallback) {
+		joinChannelMessageCallback?.Invoke(this, 0);
 
 		return Task.Run(() => {
 			while (!_linkedCts.IsCancellationRequested && _control is { CanRead: true }) {
@@ -160,7 +174,7 @@ internal sealed class RtcClient : IAsyncDisposable {
 						break;
 					case JoinChannelMessage freqMessage:
 						_logger.LogDebug("{}: Received {} from {}", nameof(HandleControlStream), freqMessage, Connection.RemoteEndPoint);
-						joinChannelMessageCallback?.Invoke(freqMessage.ChannelId);
+						joinChannelMessageCallback?.Invoke(this, freqMessage.ChannelId);
 						break;
 					default:
 						_logger.LogWarning("{}: Received invalid ({}) control message from {}", nameof(HandleControlStream), result.Message.Type, Connection.RemoteEndPoint);
@@ -172,7 +186,7 @@ internal sealed class RtcClient : IAsyncDisposable {
 
 	/// <summary>Returns a task that starts handling the data stream in the background.</summary>
 	/// <param name="getDestinationClients">A delegate to retrieve the streams the data stream should be written to. If <c>null</c> the received data is echoed back to the data stream.</param>
-	public Task HandleDataStream(Func<IEnumerable<RtcClient>>? getDestinationClients) {
+	public Task HandleDataStream(Func<RtcClient, IEnumerable<RtcClient>>? getDestinationClients) {
 		byte[] buffer = new byte[DataHeaderSize + MaxOpusPacketSize];
 
 		return Task.Run(async () => {
@@ -202,7 +216,7 @@ internal sealed class RtcClient : IAsyncDisposable {
 						await _data.WriteAsync(memory, _token);
 					}
 					else {
-						foreach (RtcClient destination in getDestinationClients()) {
+						foreach (RtcClient destination in getDestinationClients(this)) {
 							byte[] message = memory.ToArray();
 							_idBytes.CopyTo(message, 0);
 
