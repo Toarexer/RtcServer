@@ -6,3 +6,5 @@ obj/
 .vscode/
 
 *.user
+
+config.json
