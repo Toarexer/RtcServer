@@ -86,13 +86,17 @@ public sealed class RtcClient : IAsyncDisposable, IRtcClient {
 
 	/// <summary>Tries to read a control message from the control stream.</summary>
 	/// <returns>An <see cref="IControlMessage"/> or <c>null</c> if it cannot be parsed.</returns>
-	private ControlMessageResult TryReadControlMessage() {
+	private async Task<ControlMessageResult> TryReadControlMessage() {
 		if (_control is null)
 			return new ControlMessageResult(null, false);
 
 		try {
+			byte[] buffer = new byte[1];
+			await _control.ReadExactlyAsync(buffer, 0, 1, _token);
+			byte type = buffer[0];
+
+			// TODO: Replace BinaryReader with an async solution
 			using BinaryReader reader = new(_control, Encoding.UTF8, true);
-			byte type = reader.ReadByte();
 
 			IControlMessage message = type switch {
 				ControlMessage.Auth => new AuthenticationMessage(reader.ReadString(), reader.ReadString(), reader.ReadBoolean()),
@@ -101,11 +105,14 @@ public sealed class RtcClient : IAsyncDisposable, IRtcClient {
 			};
 			return new ControlMessageResult(message, false);
 		}
+		catch (OperationCanceledException) {
+			return new ControlMessageResult(null, true);
+		}
 		catch (QuicException quicException) when (quicException.QuicError is QuicError.ConnectionAborted or QuicError.StreamAborted or QuicError.ConnectionIdle) {
 			return new ControlMessageResult(null, true);
 		}
 		catch (Exception exception) {
-			_logger.LogWarning("{}: {} - {}", nameof(TryReadControlMessage), exception.GetType(), exception.Message);
+			_logger.LogWarning("{Source}: {ExceptionType} - {ExceptionMessage}", nameof(TryReadControlMessage), exception.GetType(), exception.Message);
 			return new ControlMessageResult(null, false);
 		}
 	}
@@ -127,9 +134,9 @@ public sealed class RtcClient : IAsyncDisposable, IRtcClient {
 
 	/// <summary>Reads the control stream until it receives an <see cref="AuthenticationMessage"/>.</summary>
 	/// <returns>The <see cref="AuthenticationMessage"/> or <c>null</c>, if cancellation is requested.</returns>
-	public AuthenticationMessage? WaitForAuthMessage() {
+	public async Task<AuthenticationMessage?> WaitForAuthMessage() {
 		while (!_linkedCts.IsCancellationRequested)
-			if (TryReadControlMessage().Message is AuthenticationMessage auth)
+			if (await TryReadControlMessage() is { Message: AuthenticationMessage auth })
 				return auth;
 		return null;
 	}
@@ -145,7 +152,7 @@ public sealed class RtcClient : IAsyncDisposable, IRtcClient {
 			_ = Task.Run(async () => {
 				await foreach (byte[] message in _dataChannel.Reader.ReadAllAsync(_token))
 					await _data.WriteAsync(message, _token);
-			}, _token);
+			}, CancellationToken.None);
 
 			return true;
 		}
@@ -159,29 +166,30 @@ public sealed class RtcClient : IAsyncDisposable, IRtcClient {
 	public Task HandleControlStream(Action<RtcClient, uint>? joinChannelMessageCallback) {
 		joinChannelMessageCallback?.Invoke(this, 0);
 
-		return Task.Run(() => {
+		return Task.Run(async () => {
 			while (!_linkedCts.IsCancellationRequested && _control is { CanRead: true }) {
-				ControlMessageResult result = TryReadControlMessage();
+				ControlMessageResult result = await TryReadControlMessage();
 				switch (result.Message) {
 					case null:
 						if (!result.Aborted)
-							_logger.LogCritical("{}: Received malformed control message from {}", nameof(HandleControlStream), Connection.RemoteEndPoint);
+							_logger.LogCritical("{Source}: Received malformed control message from {Remote}", nameof(HandleControlStream), Connection.RemoteEndPoint);
 						if (!_linkedCts.IsCancellationRequested)
-							_linkedCts.Cancel();
+							await _linkedCts.CancelAsync();
 						return;
 					case AuthenticationMessage:
-						_logger.LogDebug("{}: Received {} from {}", nameof(HandleControlStream), result.Message, Connection.RemoteEndPoint);
+						_logger.LogDebug("{Source}: Received {Message} from {Remote}", nameof(HandleControlStream), result.Message, Connection.RemoteEndPoint);
 						break;
-					case JoinChannelMessage freqMessage:
-						_logger.LogDebug("{}: Received {} from {}", nameof(HandleControlStream), freqMessage, Connection.RemoteEndPoint);
-						joinChannelMessageCallback?.Invoke(this, freqMessage.ChannelId);
+					case JoinChannelMessage chanMessage:
+						_logger.LogDebug("{Source}: Received {Message} from {Remote}", nameof(HandleControlStream), chanMessage, Connection.RemoteEndPoint);
+						joinChannelMessageCallback?.Invoke(this, chanMessage.ChannelId);
 						break;
 					default:
-						_logger.LogWarning("{}: Received invalid ({}) control message from {}", nameof(HandleControlStream), result.Message.Type, Connection.RemoteEndPoint);
+						_logger.LogWarning("{Source}: Received invalid ({MessageType}) control message from {Remote}", nameof(HandleControlStream), result.Message.Type,
+							Connection.RemoteEndPoint);
 						break;
 				}
 			}
-		}, _token);
+		}, CancellationToken.None);
 	}
 
 	/// <summary>Returns a task that starts handling the data stream in the background.</summary>
@@ -192,7 +200,7 @@ public sealed class RtcClient : IAsyncDisposable, IRtcClient {
 		return Task.Run(async () => {
 			try {
 				if (_data is not { CanRead: true, CanWrite: true }) {
-					await AbortAndClose(QuicError.StreamAborted);
+					AbortAndDispose();
 					return;
 				}
 
@@ -204,7 +212,7 @@ public sealed class RtcClient : IAsyncDisposable, IRtcClient {
 						case 0:
 							continue;
 						case < 0 or > MaxOpusPacketSize:
-							await AbortAndClose(QuicError.TransportError);
+							AbortAndDispose();
 							return;
 					}
 
@@ -221,54 +229,53 @@ public sealed class RtcClient : IAsyncDisposable, IRtcClient {
 							_idBytes.CopyTo(message, 0);
 
 							if (destination._data?.CanWrite is true && await TryWriteDataMessageAsync(destination, message) is { } exception)
-								_logger.LogError("{} / {}: {} - {}", nameof(HandleDataStream), nameof(TryWriteDataMessageAsync), exception.GetType(), exception.Message);
+								_logger.LogError(exception, "{Source} / {InnerSource} error", nameof(HandleDataStream), nameof(TryWriteDataMessageAsync));
 						}
 					}
 				}
 			}
 			catch (QuicException quicException) when (quicException.QuicError is QuicError.ConnectionAborted or QuicError.StreamAborted or QuicError.OperationAborted) {
-				await AbortAndClose(QuicError.ConnectionAborted);
+				AbortAndDispose();
 			}
 			catch (QuicException quicException) when (quicException.QuicError is QuicError.ConnectionIdle) {
-				_logger.LogWarning("{}: Connection from {} timed out due to inactivity", nameof(HandleDataStream), Connection.RemoteEndPoint);
-				await AbortAndClose(QuicError.ConnectionAborted);
+				_logger.LogWarning("{Source}: Connection from {Remote} timed out due to inactivity", nameof(HandleDataStream), Connection.RemoteEndPoint);
+				AbortAndDispose();
 			}
 			catch (OperationCanceledException) {
-				_logger.LogDebug("{}: Operation cancelled", nameof(HandleDataStream));
-				await AbortAndClose(QuicError.ConnectionAborted);
+				_logger.LogDebug("{Source}: Operation cancelled", nameof(HandleDataStream));
+				AbortAndDispose();
 			}
 			catch (Exception exception) {
-				_logger.LogError("{}: {} - {}", nameof(HandleDataStream), exception.GetType(), exception.Message);
-				await AbortAndClose(QuicError.InternalError);
+				_logger.LogError(exception, "{Source} error", nameof(HandleDataStream));
+				AbortAndDispose();
 			}
-		}, _token);
+		}, CancellationToken.None);
 	}
 
-	/// <summary>Aborts and disposes the <see cref="_control"/> and <see cref="_data"/> streams, then closes and disposes the <see cref="Connection"/> alongside the <see cref="_linkedCts"/>.</summary>
-	/// <param name="error">The error code to close the connection with.</param>
-	private async ValueTask AbortAndClose(QuicError error) {
+	/// <summary>Aborts and disposes <see cref="_control"/> and <see cref="_data"/> streams, then disposes <see cref="_linkedCts"/>.</summary>
+	private void AbortAndDispose() {
 		if (!_linkedCts.IsCancellationRequested)
-			await _linkedCts.CancelAsync();
+			_linkedCts.Cancel();
 
 		_dataChannel.Writer.TryComplete();
 
 		if (_control is not null) {
 			_control.Abort(QuicAbortDirection.Read, (long)QuicError.StreamAborted);
-			await _control.DisposeAsync();
+			_control.Dispose();
 		}
 
 		if (_data is not null) {
 			_data.Abort(QuicAbortDirection.Both, (long)QuicError.StreamAborted);
-			await _data.DisposeAsync();
+			_data.Dispose();
 		}
-
-		await Connection.CloseAsync((long)error, CancellationToken.None);
-		await Connection.DisposeAsync();
 
 		_linkedCts.Dispose();
 	}
 
-	public ValueTask DisposeAsync() => AbortAndClose(QuicError.ConnectionAborted);
+	public ValueTask DisposeAsync() {
+		AbortAndDispose();
+		return ValueTask.CompletedTask;
+	}
 
 	/// <summary>Tries to write a data message to the data channel of a <see cref="RtcClient"/>.</summary>
 	/// <param name="client">The <see cref="RtcClient"/> to use the data <see cref="Channel{T}"/> and <see cref="CancellationToken"/> of for the operation.</param>
@@ -286,4 +293,8 @@ public sealed class RtcClient : IAsyncDisposable, IRtcClient {
 			return exception;
 		}
 	}
+
+#if DEBUG
+	public static void ResetNextId() => _lastId = uint.MaxValue;
+#endif
 }

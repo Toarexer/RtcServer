@@ -29,8 +29,8 @@ internal static class Program {
 
 		Config config = Config.Load();
 
-		await using Server server = new();
-		await server.RunAsync(config, GlobalToken);
+		using Server server = new(config);
+		await server.RunAsync(GlobalToken);
 
 		GlobalTokenSource.Dispose();
 	}
