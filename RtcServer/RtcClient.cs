@@ -1,6 +1,5 @@
 using System.Net.Quic;
 using System.Runtime.Versioning;
-using System.Text;
 using System.Threading.Channels;
 
 namespace RtcServer;
@@ -78,29 +77,25 @@ public sealed class RtcClient : IAsyncDisposable, IRtcClient {
 		_linkedCts = CancellationTokenSource.CreateLinkedTokenSource(token);
 		_token = _linkedCts.Token;
 
-		using ILoggerFactory factory = LoggerFactory.Create(builder => builder.AddSimpleConsole(scf => scf.TimestampFormat = "HH:mm:ss ").SetMinimumLevel(minLogLevel));
-		_logger = factory.CreateLogger(nameof(RtcClient));
+		using ILoggerFactory factory = LoggerFactory.Create(builder => builder.AddSimpleConsole().SetMinimumLevel(minLogLevel));
+		_logger = factory.CreateLogger<RtcClient>();
 
 		Connection = connection;
 	}
 
 	/// <summary>Tries to read a control message from the control stream.</summary>
 	/// <returns>An <see cref="IControlMessage"/> or <c>null</c> if it cannot be parsed.</returns>
-	private async Task<ControlMessageResult> TryReadControlMessage() {
+	private async Task<ControlMessageResult> TryReadControlMessageAsync() {
 		if (_control is null)
 			return new ControlMessageResult(null, false);
 
 		try {
-			byte[] buffer = new byte[1];
-			await _control.ReadExactlyAsync(buffer, 0, 1, _token);
-			byte type = buffer[0];
-
-			// TODO: Replace BinaryReader with an async solution
-			using BinaryReader reader = new(_control, Encoding.UTF8, true);
+			byte type = await _control.ReadByteAsync(_token);
+			_logger.LogTrace("Received control message type {Type} from {Remote}", type, Connection.RemoteEndPoint);
 
 			IControlMessage message = type switch {
-				ControlMessage.Auth => new AuthenticationMessage(reader.ReadString(), reader.ReadString(), reader.ReadBoolean()),
-				ControlMessage.Chan => new JoinChannelMessage(reader.ReadUInt32()),
+				ControlMessage.Auth => await _control.ReadAuthMessageAsync(_token),
+				ControlMessage.Chan => await _control.ReadChanMessageAsync(_token),
 				_                   => new InvalidMessage(type)
 			};
 			return new ControlMessageResult(message, false);
@@ -112,14 +107,14 @@ public sealed class RtcClient : IAsyncDisposable, IRtcClient {
 			return new ControlMessageResult(null, true);
 		}
 		catch (Exception exception) {
-			_logger.LogWarning("{Source}: {ExceptionType} - {ExceptionMessage}", nameof(TryReadControlMessage), exception.GetType(), exception.Message);
+			_logger.LogWarning("{Source}: {ExceptionType} - {ExceptionMessage}", nameof(TryReadControlMessageAsync), exception.GetType(), exception.Message);
 			return new ControlMessageResult(null, false);
 		}
 	}
 
 	/// <summary>Waits for an inbound stream and sets is as the control stream, if it is readable, but not writable.</summary>
 	/// <returns><c>true</c> on success and <c>false</c> on failure.</returns>
-	public async Task<bool> WaitForControlStream() {
+	public async Task<bool> WaitForControlStreamAsync() {
 		try {
 			if (await Connection.AcceptInboundStreamAsync(_token) is not { CanRead: true, CanWrite: false } stream)
 				return false;
@@ -134,24 +129,31 @@ public sealed class RtcClient : IAsyncDisposable, IRtcClient {
 
 	/// <summary>Reads the control stream until it receives an <see cref="AuthenticationMessage"/>.</summary>
 	/// <returns>The <see cref="AuthenticationMessage"/> or <c>null</c>, if cancellation is requested.</returns>
-	public async Task<AuthenticationMessage?> WaitForAuthMessage() {
+	public async Task<AuthenticationMessage?> WaitForAuthMessageAsync() {
 		while (!_linkedCts.IsCancellationRequested)
-			if (await TryReadControlMessage() is { Message: AuthenticationMessage auth })
+			if (await TryReadControlMessageAsync() is { Message: AuthenticationMessage auth })
 				return auth;
 		return null;
 	}
 
 	/// <summary>Waits for an inbound stream and sets it as the data stream, if it is both readable and writable.</summary>
 	/// <returns><c>true</c> on success and <c>false</c> on failure.</returns>
-	public async Task<bool> WaitForDataStream() {
+	public async Task<bool> WaitForDataStreamAsync() {
 		try {
 			if (await Connection.AcceptInboundStreamAsync(_token) is not { CanRead: true, CanWrite: true } stream)
 				return false;
 
 			_data = stream;
 			_ = Task.Run(async () => {
-				await foreach (byte[] message in _dataChannel.Reader.ReadAllAsync(_token))
-					await _data.WriteAsync(message, _token);
+				try {
+					await foreach (byte[] message in _dataChannel.Reader.ReadAllAsync(_token)) {
+						await _data.WriteAsync(message, _token);
+						_logger.LogTrace("Read {Length} bytes from the data channel", message.Length);
+					}
+				}
+				catch (OperationCanceledException) {
+					_logger.LogDebug("{Source} / pump task was aborted", nameof(WaitForDataStreamAsync));
+				}
 			}, CancellationToken.None);
 
 			return true;
@@ -163,29 +165,32 @@ public sealed class RtcClient : IAsyncDisposable, IRtcClient {
 
 	/// <summary>Returns a task that starts handling the control stream in the background.</summary>
 	/// <param name="joinChannelMessageCallback">A delegate that will be called when a <see cref="JoinChannelMessage"/> is received. The requested channel id is passed to the delegate.</param>
-	public Task HandleControlStream(Action<RtcClient, uint>? joinChannelMessageCallback) {
+	public Task HandleControlStreamAsync(Action<RtcClient, uint>? joinChannelMessageCallback) {
 		joinChannelMessageCallback?.Invoke(this, 0);
 
 		return Task.Run(async () => {
 			while (!_linkedCts.IsCancellationRequested && _control is { CanRead: true }) {
-				ControlMessageResult result = await TryReadControlMessage();
+				ControlMessageResult result = await TryReadControlMessageAsync();
 				switch (result.Message) {
 					case null:
-						if (!result.Aborted)
-							_logger.LogCritical("{Source}: Received malformed control message from {Remote}", nameof(HandleControlStream), Connection.RemoteEndPoint);
-						if (!_linkedCts.IsCancellationRequested)
-							await _linkedCts.CancelAsync();
+						if (result.Aborted) {
+							_logger.LogDebug("{Source} was aborted", nameof(HandleControlStreamAsync));
+							return;
+						}
+
+						_logger.LogCritical("Received malformed control message from {Remote}", Remote);
+						AbortAndDispose();
 						return;
 					case AuthenticationMessage:
-						_logger.LogDebug("{Source}: Received {Message} from {Remote}", nameof(HandleControlStream), result.Message, Connection.RemoteEndPoint);
+						_logger.LogDebug("Received {Message} from {Remote}", result.Message, Remote);
 						break;
 					case JoinChannelMessage chanMessage:
-						_logger.LogDebug("{Source}: Received {Message} from {Remote}", nameof(HandleControlStream), chanMessage, Connection.RemoteEndPoint);
+						_logger.LogDebug("Received {Message} from {Remote}", chanMessage, Remote);
 						joinChannelMessageCallback?.Invoke(this, chanMessage.ChannelId);
 						break;
 					default:
-						_logger.LogWarning("{Source}: Received invalid ({MessageType}) control message from {Remote}", nameof(HandleControlStream), result.Message.Type,
-							Connection.RemoteEndPoint);
+						_logger.LogCritical("Received invalid ({MessageType}) control message from {Remote}", result.Message.Type, Remote);
+						AbortAndDispose();
 						break;
 				}
 			}
@@ -194,7 +199,7 @@ public sealed class RtcClient : IAsyncDisposable, IRtcClient {
 
 	/// <summary>Returns a task that starts handling the data stream in the background.</summary>
 	/// <param name="getDestinationClients">A delegate to retrieve the streams the data stream should be written to. If <c>null</c> the received data is echoed back to the data stream.</param>
-	public Task HandleDataStream(Func<RtcClient, IEnumerable<RtcClient>>? getDestinationClients) {
+	public Task HandleDataStreamAsync(Func<RtcClient, IEnumerable<RtcClient>>? getDestinationClients) {
 		byte[] buffer = new byte[DataHeaderSize + MaxOpusPacketSize];
 
 		return Task.Run(async () => {
@@ -207,6 +212,7 @@ public sealed class RtcClient : IAsyncDisposable, IRtcClient {
 				while (_data is { CanRead: true, CanWrite: true }) {
 					await _data.ReadExactlyAsync(buffer, DataHeaderIdSize, DataHeaderLengthSize, _token);
 					int length = buffer[DataHeaderIdSize] | (buffer[DataHeaderIdSize + 1] << 8);
+					_logger.LogTrace("Read {Size} byte length value from the data stream: {Length}", DataHeaderLengthSize, length);
 
 					switch (length) {
 						case 0:
@@ -217,11 +223,14 @@ public sealed class RtcClient : IAsyncDisposable, IRtcClient {
 					}
 
 					await _data.ReadExactlyAsync(buffer, DataHeaderSize, length, _token);
+					_logger.LogTrace("Read {Length} bytes from the data stream", length);
+
 					ReadOnlyMemory<byte> memory = new(buffer, 0, DataHeaderSize + length);
 
 					if (getDestinationClients is null) {
 						_idBytes.CopyTo(buffer, 0);
 						await _data.WriteAsync(memory, _token);
+						_logger.LogTrace("Echoed back {Length} bytes", memory.Length);
 					}
 					else {
 						foreach (RtcClient destination in getDestinationClients(this)) {
@@ -229,7 +238,9 @@ public sealed class RtcClient : IAsyncDisposable, IRtcClient {
 							_idBytes.CopyTo(message, 0);
 
 							if (destination._data?.CanWrite is true && await TryWriteDataMessageAsync(destination, message) is { } exception)
-								_logger.LogError(exception, "{Source} / {InnerSource} error", nameof(HandleDataStream), nameof(TryWriteDataMessageAsync));
+								_logger.LogError(exception, "{Source} / {InnerSource} error", nameof(HandleDataStreamAsync), nameof(TryWriteDataMessageAsync));
+							else
+								_logger.LogTrace("Wrote {Length} bytes to the data channel of client {Destination}", message.Length, destination.Id);
 						}
 					}
 				}
@@ -238,15 +249,15 @@ public sealed class RtcClient : IAsyncDisposable, IRtcClient {
 				AbortAndDispose();
 			}
 			catch (QuicException quicException) when (quicException.QuicError is QuicError.ConnectionIdle) {
-				_logger.LogWarning("{Source}: Connection from {Remote} timed out due to inactivity", nameof(HandleDataStream), Connection.RemoteEndPoint);
+				_logger.LogWarning("Connection from {Remote} timed out due to inactivity", Remote);
 				AbortAndDispose();
 			}
 			catch (OperationCanceledException) {
-				_logger.LogDebug("{Source}: Operation cancelled", nameof(HandleDataStream));
+				_logger.LogDebug("{Source} was aborted", nameof(HandleDataStreamAsync));
 				AbortAndDispose();
 			}
 			catch (Exception exception) {
-				_logger.LogError(exception, "{Source} error", nameof(HandleDataStream));
+				_logger.LogError(exception, "{Source} error", nameof(HandleDataStreamAsync));
 				AbortAndDispose();
 			}
 		}, CancellationToken.None);
@@ -270,6 +281,8 @@ public sealed class RtcClient : IAsyncDisposable, IRtcClient {
 		}
 
 		_linkedCts.Dispose();
+
+		_logger.LogDebug("Aborted and disposed the streams of client {Id}", Id);
 	}
 
 	public ValueTask DisposeAsync() {

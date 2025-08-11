@@ -1,3 +1,7 @@
+using System.Buffers.Binary;
+using System.Net.Quic;
+using System.Text;
+
 namespace RtcServer;
 
 /// <summary>Valid control message types.</summary>
@@ -20,11 +24,10 @@ public interface IControlMessage {
 internal record InvalidMessage(byte Type) : IControlMessage;
 
 /// <summary>An <see cref="IControlMessage"/> used for <see cref="RtcClient"/> authentication.</summary>
+/// <param name="Echo">Echo the data received back to the client or broadcast it to other clients.</param>
 /// <param name="Username">The username to use for authentication.</param>
 /// <param name="Password">The password to use for authentication.</param>
-/// <param name="Echo">Echo the data received back to the client or broadcast it to other clients.</param>
-// TODO: Use JWT authentication instead.
-public record AuthenticationMessage(string Username, string Password, bool Echo) : IControlMessage {
+public record AuthenticationMessage(bool Echo, string Username, string Password) : IControlMessage {
 	public byte Type => ControlMessage.Auth;
 }
 
@@ -32,4 +35,55 @@ public record AuthenticationMessage(string Username, string Password, bool Echo)
 /// <param name="ChannelId">The ID of the channel to join to.</param>
 public record JoinChannelMessage(uint ChannelId) : IControlMessage {
 	public byte Type => ControlMessage.Chan;
+}
+
+public static class ControlMessageQuicStreamExtensions {
+	/// <summary>Reads a single byte from the stream.</summary>
+	/// <returns>The byte read from the stream.</returns>
+	public static async Task<byte> ReadByteAsync(this QuicStream stream, CancellationToken token) {
+		byte[] buffer = new byte[sizeof(byte)];
+		await stream.ReadExactlyAsync(buffer, token);
+		return buffer[0];
+	}
+
+	/// <summary>Reads a single byte from the stream.</summary>
+	/// <returns><c>false</c> if the read byte is 0, otherwise <c>true</c>.</returns>
+	private static async Task<bool> ReadBoolAsync(this QuicStream stream, CancellationToken token) {
+		byte value = await stream.ReadByteAsync(token);
+		return value != 0;
+	}
+
+	/// <summary>Reads 4 bytes from the stream.</summary>
+	/// <returns>The bytes converted to a little endian <see cref="uint"/>.</returns>
+	private static async Task<uint> ReadUInt32LeAsync(this QuicStream stream, CancellationToken token) {
+		byte[] buffer = new byte[sizeof(uint)];
+		await stream.ReadExactlyAsync(buffer, token);
+		return BinaryPrimitives.ReadUInt32LittleEndian(buffer);
+	}
+
+	/// <summary>Reads a single byte from the stream, and then an additional number of bytes equal to the value of the first byte.</summary>
+	/// <returns>An UTF8 string that has the maximum length of 255 when represented as a byte array.</returns>
+	private static async Task<string> ReadUtf8String255Async(this QuicStream stream, CancellationToken token) {
+		byte length = await stream.ReadByteAsync(token);
+		if (length == 0)
+			return "";
+
+		byte[] buffer = new byte[length];
+		await stream.ReadExactlyAsync(buffer, token);
+		return Encoding.UTF8.GetString(buffer);
+	}
+
+	/// <summary>Reads an <see cref="AuthenticationMessage"/> from the stream.</summary>
+	public static async Task<AuthenticationMessage> ReadAuthMessageAsync(this QuicStream stream, CancellationToken token) {
+		bool echo = await stream.ReadBoolAsync(token);
+		string username = await stream.ReadUtf8String255Async(token);
+		string password = await stream.ReadUtf8String255Async(token);
+		return new AuthenticationMessage(echo, username, password);
+	}
+
+	/// <summary>Reads a <see cref="JoinChannelMessage"/> from the stream.</summary>
+	public static async Task<JoinChannelMessage> ReadChanMessageAsync(this QuicStream stream, CancellationToken token) {
+		uint id = await stream.ReadUInt32LeAsync(token);
+		return new JoinChannelMessage(id);
+	}
 }

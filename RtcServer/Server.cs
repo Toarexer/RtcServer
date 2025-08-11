@@ -41,7 +41,7 @@ public sealed class Server : IDisposable {
 			};
 
 			_loggerFactory = LoggerFactory.Create(builder => builder.AddSimpleConsole().SetMinimumLevel(config.LogLevel));
-			_logger = _loggerFactory.CreateLogger(nameof(Server));
+			_logger = _loggerFactory.CreateLogger<Server>();
 		}
 		catch (Exception) {
 			_certificate?.Dispose();
@@ -91,7 +91,7 @@ public sealed class Server : IDisposable {
 					QuicConnection connection = await listener.AcceptConnectionAsync(token);
 					_ = Task.Run(async () => {
 						_logger.LogInformation("Accepted connection from {Remote}", connection.RemoteEndPoint);
-						await HandleConnection(connection, token);
+						await HandleConnectionAsync(connection, token);
 
 						await connection.CloseAsync(connOptions.DefaultCloseErrorCode, CancellationToken.None);
 						await connection.DisposeAsync();
@@ -116,6 +116,61 @@ public sealed class Server : IDisposable {
 		}
 	}
 
+	/// <summary>Runs the server without the RESTful API and returns a Task that only completes when the token is triggered.</summary>
+	/// <param name="token">The token to trigger shutdown.</param>
+	/// <exception cref="PlatformNotSupportedException">The current platform is not Linux or Windows.</exception>
+	public async Task RunWithoutKestrelAsync(CancellationToken token) {
+		if (!OperatingSystem.IsLinux() && !OperatingSystem.IsWindows())
+			throw new PlatformNotSupportedException("Only Linux and Windows platforms are supported");
+
+		SslServerAuthenticationOptions authOptions = new() {
+			ApplicationProtocols = [Alpn],
+			ServerCertificate = _certificate
+		};
+
+		QuicServerConnectionOptions connOptions = new() {
+			DefaultCloseErrorCode = (long)QuicError.ConnectionAborted,
+			DefaultStreamErrorCode = (long)QuicError.StreamAborted,
+			IdleTimeout = TimeSpan.FromMinutes(5),
+			ServerAuthenticationOptions = authOptions
+		};
+
+		QuicListener? listener = null;
+
+		try {
+			listener = await QuicListener.ListenAsync(new QuicListenerOptions {
+				ApplicationProtocols = authOptions.ApplicationProtocols,
+				ConnectionOptionsCallback = (_, _, _) => ValueTask.FromResult(connOptions),
+				ListenEndPoint = new IPEndPoint(IPAddress.Any, _config.QuicPort)
+			}, token);
+			_logger.LogInformation("Started QUIC listener on port {Port}", listener.LocalEndPoint.Port);
+
+			while (true)
+				try {
+					QuicConnection connection = await listener.AcceptConnectionAsync(token);
+					_ = Task.Run(async () => {
+						_logger.LogInformation("Accepted connection from {Remote}", connection.RemoteEndPoint);
+						await HandleConnectionAsync(connection, token);
+
+						await connection.CloseAsync(connOptions.DefaultCloseErrorCode, CancellationToken.None);
+						await connection.DisposeAsync();
+						_logger.LogInformation("Closed connection from {Remote}", connection.RemoteEndPoint);
+					}, CancellationToken.None);
+				}
+				catch (OperationCanceledException) {
+					_logger.LogInformation("Shut down QUIC listener");
+					break;
+				}
+				catch (Exception exception) {
+					_logger.LogCritical(exception, "QUIC listener error");
+				}
+		}
+		finally {
+			if (listener is not null)
+				await listener.DisposeAsync();
+		}
+	}
+
 	/// <summary>Creates a new instance of a <see cref="WebApplication"/> and maps endpoints to it.</summary>
 	/// <returns>The newly created <see cref="WebApplication"/>.</returns>
 	private WebApplication CreateWebApplication() {
@@ -136,18 +191,18 @@ public sealed class Server : IDisposable {
 		return app;
 	}
 
-	private async Task HandleConnection(QuicConnection connection, CancellationToken token) {
+	private async Task HandleConnectionAsync(QuicConnection connection, CancellationToken token) {
 		await using RtcClient client = new(connection, token, _config.LogLevel);
 
 		try {
-			if (!await client.WaitForControlStream()) {
+			if (!await client.WaitForControlStreamAsync()) {
 				_logger.LogError("Failed to accept control stream from {Remote}", connection.RemoteEndPoint);
 				return;
 			}
 
 			_logger.LogInformation("Accepted control stream from {Remote}", connection.RemoteEndPoint);
 
-			if (await client.WaitForAuthMessage() is not { } auth) {
+			if (await client.WaitForAuthMessageAsync() is not { } auth) {
 				_logger.LogWarning("Failed to authenticate connection from {Remote}", connection.RemoteEndPoint);
 				return;
 			}
@@ -161,15 +216,15 @@ public sealed class Server : IDisposable {
 
 			client.Alias = auth.Username;
 
-			if (!await client.WaitForDataStream()) {
+			if (!await client.WaitForDataStreamAsync()) {
 				_logger.LogError("Failed to accept data stream from {Remote}", connection.RemoteEndPoint);
 				return;
 			}
 
 			_logger.LogInformation("Accepted data stream from {Remote}", connection.RemoteEndPoint);
 
-			Task controlTask = client.HandleControlStream(ChangeChannel);
-			Task dataTask = client.HandleDataStream(auth.Echo ? null : GetOtherClients);
+			Task controlTask = client.HandleControlStreamAsync(ChangeChannel);
+			Task dataTask = client.HandleDataStreamAsync(auth.Echo ? null : GetOtherClients);
 
 			await Task.WhenAll(controlTask, dataTask);
 		}
