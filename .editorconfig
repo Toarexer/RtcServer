@@ -64,10 +64,6 @@ resharper_outdent_statement_labels = true
 resharper_xmldoc_indent_style = tab
 resharper_xmldoc_max_line_length = 192
 
-[*.{csproj,sln}]
-indent_style = space
-indent_size = 2
-
 [*.cs]
 indent_size = 4
 indent_style = tab
@@ -76,6 +72,6 @@ indent_style = tab
 indent_size = 4
 indent_style = tab
 
-[*.md]
+[*.{csproj,md,sln,yml}]
 indent_size = 2
 indent_style = space
