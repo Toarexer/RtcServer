@@ -7,14 +7,14 @@
 - [**.NET 9**](https://dotnet.microsoft.com/)
 - [**MsQuic**](https://github.com/microsoft/msquic)
 
-### Projects
+## Projects
 
 | Name                                   | Description                                                                             |
 |:---------------------------------------|:----------------------------------------------------------------------------------------|
 | [**RtcServer**](./RtcServer)           | Contains the server implementation.                                                     |
 | [**RtcServerTests**](./RtcServerTests) | Contains unit and basic integration tests for checking the functionality of the server. |
 
-### Getting started
+## Getting started
 
 **1.** Create a `config.json` file in the [RtcServer](./RtcServer) directory
 or specify the required environment variables.
@@ -22,12 +22,12 @@ or specify the required environment variables.
 Config file example:
 
 ```json
-  {
-    "QuicPort": 7172,
-    "HttpPort": 8080,
-    "AuthorizationUri": "http://localhost:8080/auth/allow-all",
-    "LogLevel": 0
-  }
+{
+  "QuicPort": 7172,
+  "HttpPort": 8080,
+  "AuthorizationUri": "http://localhost:8080/auth/allow-all",
+  "LogLevel": 0
+}
 ```
 
 Environment variables:
@@ -39,6 +39,11 @@ Environment variables:
 
 > [!NOTE]
 > `/auth/allow-all` is a builtin endpoint for testing, that accepts all clients.
+>
+> The log level is specified using a
+> [LogLevel](https://learn.microsoft.com/en-us/dotnet/api/microsoft.extensions.logging.loglevel?view=net-9.0-pp) value.
+
+<br>
 
 **2.** Run the [RtcServer](./RtcServer) project using the dotnet CLI tool.
 
@@ -46,7 +51,7 @@ Environment variables:
 dotnet run --project RtcServer
 ```
 
-### User authentication
+## User authentication
 
 User authentication can be achieved by creating a web server
 and an endpoint which accepts POST requests and specify it for the server using `AuthorizationUri`.
@@ -57,7 +62,7 @@ that contains an [AuthorizationRequest](./RtcServer/Models.cs#L11) object as JSO
 The server accepts the client if the specified web server responds with a successful status code within 5 seconds.
 Otherwise, it aborts the connection.
 
-### Endpoints
+## Endpoints
 
 | Method | Path              | Description                                                                |
 |:-------|:------------------|:---------------------------------------------------------------------------|
@@ -71,10 +76,14 @@ Otherwise, it aborts the connection.
 > [!WARNING]
 > These endpoints are not meant to be publicly exposed!
 
-### Running the tests
+## Running the tests
 
-**Run the [RtcServerServer](./RtcServerTests) project using the dotnet CLI tool.**
+Run the [RtcServerTests](./RtcServerTests) project using the dotnet CLI tool.
 
 ```
 dotnet test
 ```
+
+## QUIC RTC Server Protocol
+
+The specification of the protocol used by the server can be found [**here**](./PROTOCOL.md).
