@@ -5,6 +5,7 @@ using System.Net.Security;
 using System.Reflection;
 using System.Runtime.Versioning;
 using System.Security.Cryptography.X509Certificates;
+using Microsoft.Extensions.Logging.Console;
 
 namespace RtcServer;
 
@@ -18,8 +19,6 @@ public sealed class Server : IDisposable {
 	private readonly HttpClient _httpClient;
 
 	private readonly ILogger _logger;
-
-	private readonly ILoggerFactory _loggerFactory;
 
 	private readonly RtcClientStore<RtcClient> _store;
 
@@ -40,13 +39,16 @@ public sealed class Server : IDisposable {
 				Timeout = TimeSpan.FromSeconds(5)
 			};
 
-			_loggerFactory = LoggerFactory.Create(builder => builder.AddSimpleConsole().SetMinimumLevel(config.LogLevel));
-			_logger = _loggerFactory.CreateLogger<Server>();
+			using ILoggerFactory factory = LoggerFactory.Create(builder => builder
+				.AddConsole(cl => cl.FormatterName = nameof(AnsiFormatter))
+				.AddConsoleFormatter<AnsiFormatter, ConsoleFormatterOptions>()
+				.SetMinimumLevel(config.LogLevel)
+			);
+			_logger = factory.CreateLogger<Server>();
 		}
 		catch (Exception) {
 			_certificate?.Dispose();
 			_httpClient?.Dispose();
-			_loggerFactory?.Dispose();
 
 			throw;
 		}
@@ -171,11 +173,17 @@ public sealed class Server : IDisposable {
 		}
 	}
 
+	/// <summary>Gets the <see cref="RtcClientStoreInfo"/> of the server's <see cref="RtcClientStore{TRtcClient}"/>.</summary>
+	public RtcClientStoreInfo GetStoreInfo() => _store.GetStoreInfo();
+
+	/// <summary>Gets the <see cref="RtcClientInfos{TRtcClient}"/> of the server's <see cref="RtcClientStore{TRtcClient}"/>.</summary>
+	public RtcClientInfos<RtcClient> GetClientInfos() => _store.GetClientInfos();
+
 	/// <summary>Creates a new instance of a <see cref="WebApplication"/> and maps endpoints to it.</summary>
 	/// <returns>The newly created <see cref="WebApplication"/>.</returns>
 	private WebApplication CreateWebApplication() {
 		WebApplicationBuilder builder = WebApplication.CreateBuilder();
-		builder.Logging.SetMinimumLevel(_config.LogLevel);
+		builder.Logging.AddConsole(cl => cl.FormatterName = nameof(AnsiFormatter)).AddConsoleFormatter<AnsiFormatter, ConsoleFormatterOptions>().SetMinimumLevel(_config.LogLevel);
 		builder.WebHost.ConfigureKestrel(kso => kso.ListenAnyIP(_config.HttpPort));
 
 		AppInfo appInfo = new(builder.Environment.EnvironmentName, GetCommit());
@@ -254,7 +262,6 @@ public sealed class Server : IDisposable {
 
 		_httpClient.Dispose();
 		_certificate.Dispose();
-		_loggerFactory.Dispose();
 
 		_store.Clear();
 	}

@@ -1,16 +1,19 @@
+using System.Buffers.Binary;
+using System.Collections.Immutable;
 using System.Net.Quic;
 using System.Runtime.Versioning;
 using System.Threading.Channels;
+using Microsoft.Extensions.Logging.Console;
 
 namespace RtcServer;
 
 /// <summary>The base interface for RTC clients.</summary>
 public interface IRtcClient {
-	/// <summary>The ID of the client</summary>
+	/// <summary>The ID of the client.</summary>
 	uint Id { get; }
 
 	/// <summary>An optional alias for the client.</summary>
-	string? Alias { get; set; }
+	string? Alias { get; }
 
 	/// <summary>The remote address of the client.</summary>
 	string? Remote { get; }
@@ -26,14 +29,20 @@ public interface IRtcClient {
 public sealed class RtcClient : IAsyncDisposable, IRtcClient {
 	private record ControlMessageResult(IControlMessage? Message, bool Aborted);
 
-	private const int DataHeaderIdSize     = 4;
-	private const int DataHeaderLengthSize = 2;
-	private const int DataHeaderSize       = DataHeaderIdSize + DataHeaderLengthSize;
+	/// <summary>The size of the first segment of a data message that stores the original sender's ID.</summary>
+	public const int DataHeaderIdSize = 4;
+
+	/// <summary>The size of the second segment of a data message that contains the size of the following data segment.</summary>
+	public const int DataHeaderLengthSize = 2;
+
+	/// <summary>The combined size of <see cref="DataHeaderIdSize"/> and <see cref="DataHeaderLengthSize"/>.</summary>
+	public const int DataHeaderSize = DataHeaderIdSize + DataHeaderLengthSize;
+
+	/// <summary>The maximum size of the third segment of a data message containing the Opus packet.</summary>
+	/// <remarks>https://www.rfc-editor.org/rfc/rfc6716</remarks>
+	public const int MaxDataSize = 1275;
 
 	private const int DataChannelCapacity = 128;
-
-	/// <summary>https://www.rfc-editor.org/rfc/rfc6716</summary>
-	private const int MaxOpusPacketSize = 1275;
 
 	/// <summary>The <see cref="QuicConnection"/> the client was created with.</summary>
 	public readonly QuicConnection Connection;
@@ -44,9 +53,11 @@ public sealed class RtcClient : IAsyncDisposable, IRtcClient {
 
 	public string Remote => Connection.RemoteEndPoint.ToString();
 
-	private readonly Channel<byte[]> _dataChannel = Channel.CreateBounded<byte[]>(new BoundedChannelOptions(DataChannelCapacity) { SingleReader = true });
-
-	private readonly byte[] _idBytes;
+	private readonly Channel<byte[]> _dataChannel = Channel.CreateBounded<byte[]>(new BoundedChannelOptions(DataChannelCapacity) {
+		FullMode = BoundedChannelFullMode.DropWrite,
+		SingleReader = true,
+		SingleWriter = false
+	});
 
 	private readonly CancellationTokenSource _linkedCts;
 
@@ -72,13 +83,16 @@ public sealed class RtcClient : IAsyncDisposable, IRtcClient {
 	/// <param name="minLogLevel">The minimum <see cref="LogLevel"/> to set for the internal <see cref="ILogger"/>.</param>
 	public RtcClient(QuicConnection connection, CancellationToken token, LogLevel minLogLevel = LogLevel.Information) {
 		Id = Interlocked.Increment(ref _lastId);
-		_idBytes = BitConverter.GetBytes(Id);
 
 		_linkedCts = CancellationTokenSource.CreateLinkedTokenSource(token);
 		_token = _linkedCts.Token;
 
-		using ILoggerFactory factory = LoggerFactory.Create(builder => builder.AddSimpleConsole().SetMinimumLevel(minLogLevel));
-		_logger = factory.CreateLogger<RtcClient>();
+		using ILoggerFactory factory = LoggerFactory.Create(builder => builder
+			.AddConsole(cl => cl.FormatterName = nameof(AnsiFormatter))
+			.AddConsoleFormatter<AnsiFormatter, ConsoleFormatterOptions>()
+			.SetMinimumLevel(minLogLevel)
+		);
+		_logger = factory.CreateLogger($"{typeof(RtcClient)}[{Id}]");
 
 		Connection = connection;
 	}
@@ -107,7 +121,7 @@ public sealed class RtcClient : IAsyncDisposable, IRtcClient {
 			return new ControlMessageResult(null, true);
 		}
 		catch (Exception exception) {
-			_logger.LogWarning("{Source}: {ExceptionType} - {ExceptionMessage}", nameof(TryReadControlMessageAsync), exception.GetType(), exception.Message);
+			_logger.LogError(exception, nameof(TryReadControlMessageAsync));
 			return new ControlMessageResult(null, false);
 		}
 	}
@@ -128,11 +142,17 @@ public sealed class RtcClient : IAsyncDisposable, IRtcClient {
 	}
 
 	/// <summary>Reads the control stream until it receives an <see cref="AuthenticationMessage"/>.</summary>
-	/// <returns>The <see cref="AuthenticationMessage"/> or <c>null</c>, if cancellation is requested.</returns>
+	/// <returns>An <see cref="AuthenticationMessage"/> or <c>null</c>, if cancellation is requested.</returns>
 	public async Task<AuthenticationMessage?> WaitForAuthMessageAsync() {
 		while (!_linkedCts.IsCancellationRequested)
-			if (await TryReadControlMessageAsync() is { Message: AuthenticationMessage auth })
-				return auth;
+			switch (await TryReadControlMessageAsync()) {
+				case { Message: AuthenticationMessage auth }:
+					return auth;
+				case { Message: null, Aborted: false }:
+					AbortAndDispose();
+					break;
+			}
+
 		return null;
 	}
 
@@ -147,12 +167,13 @@ public sealed class RtcClient : IAsyncDisposable, IRtcClient {
 			_ = Task.Run(async () => {
 				try {
 					await foreach (byte[] message in _dataChannel.Reader.ReadAllAsync(_token)) {
-						await _data.WriteAsync(message, _token);
 						_logger.LogTrace("Read {Length} bytes from the data channel", message.Length);
+						await _data.WriteAsync(message, _token);
+						_logger.LogTrace("Wrote {Length} bytes to the data stream", message.Length);
 					}
 				}
 				catch (OperationCanceledException) {
-					_logger.LogDebug("{Source} / pump task was aborted", nameof(WaitForDataStreamAsync));
+					_logger.LogDebug("{Source} - pump task was aborted", nameof(WaitForDataStreamAsync));
 				}
 			}, CancellationToken.None);
 
@@ -178,7 +199,7 @@ public sealed class RtcClient : IAsyncDisposable, IRtcClient {
 							return;
 						}
 
-						_logger.LogCritical("Received malformed control message from {Remote}", Remote);
+						_logger.LogError("Received malformed control message from {Remote}", Remote);
 						AbortAndDispose();
 						return;
 					case AuthenticationMessage:
@@ -189,7 +210,7 @@ public sealed class RtcClient : IAsyncDisposable, IRtcClient {
 						joinChannelMessageCallback?.Invoke(this, chanMessage.ChannelId);
 						break;
 					default:
-						_logger.LogCritical("Received invalid ({MessageType}) control message from {Remote}", result.Message.Type, Remote);
+						_logger.LogError("Received invalid ({MessageType}) control message from {Remote}", result.Message.Type, Remote);
 						AbortAndDispose();
 						break;
 				}
@@ -199,8 +220,8 @@ public sealed class RtcClient : IAsyncDisposable, IRtcClient {
 
 	/// <summary>Returns a task that starts handling the data stream in the background.</summary>
 	/// <param name="getDestinationClients">A delegate to retrieve the streams the data stream should be written to. If <c>null</c> the received data is echoed back to the data stream.</param>
-	public Task HandleDataStreamAsync(Func<RtcClient, IEnumerable<RtcClient>>? getDestinationClients) {
-		byte[] buffer = new byte[DataHeaderSize + MaxOpusPacketSize];
+	public Task HandleDataStreamAsync(Func<RtcClient, ImmutableHashSet<RtcClient>>? getDestinationClients) {
+		byte[] buffer = new byte[DataHeaderSize + MaxDataSize];
 
 		return Task.Run(async () => {
 			try {
@@ -211,13 +232,13 @@ public sealed class RtcClient : IAsyncDisposable, IRtcClient {
 
 				while (_data is { CanRead: true, CanWrite: true }) {
 					await _data.ReadExactlyAsync(buffer, DataHeaderIdSize, DataHeaderLengthSize, _token);
-					int length = buffer[DataHeaderIdSize] | (buffer[DataHeaderIdSize + 1] << 8);
+					short length = BinaryPrimitives.ReadInt16LittleEndian(buffer.AsSpan(DataHeaderIdSize));
 					_logger.LogTrace("Read {Size} byte length value from the data stream: {Length}", DataHeaderLengthSize, length);
 
 					switch (length) {
 						case 0:
 							continue;
-						case < 0 or > MaxOpusPacketSize:
+						case < 0 or > MaxDataSize:
 							AbortAndDispose();
 							return;
 					}
@@ -225,20 +246,29 @@ public sealed class RtcClient : IAsyncDisposable, IRtcClient {
 					await _data.ReadExactlyAsync(buffer, DataHeaderSize, length, _token);
 					_logger.LogTrace("Read {Length} bytes from the data stream", length);
 
+					BinaryPrimitives.WriteUInt32LittleEndian(buffer, Id);
 					ReadOnlyMemory<byte> memory = new(buffer, 0, DataHeaderSize + length);
 
 					if (getDestinationClients is null) {
-						_idBytes.CopyTo(buffer, 0);
 						await _data.WriteAsync(memory, _token);
 						_logger.LogTrace("Echoed back {Length} bytes", memory.Length);
 					}
 					else {
-						foreach (RtcClient destination in getDestinationClients(this)) {
+						ImmutableHashSet<RtcClient> destinations = getDestinationClients(this);
+
+						if (_logger.IsEnabled(LogLevel.Trace)) {
+							string destinationIds = string.Join(", ", destinations.Where(x => x != this).Select(x => x.Id));
+							_logger.LogTrace("Broadcast destinations: {Destinations}", destinationIds);
+						}
+
+						foreach (RtcClient destination in destinations) {
+							if (Id == destination.Id)
+								continue;
+
 							byte[] message = memory.ToArray();
-							_idBytes.CopyTo(message, 0);
 
 							if (destination._data?.CanWrite is true && await TryWriteDataMessageAsync(destination, message) is { } exception)
-								_logger.LogError(exception, "{Source} / {InnerSource} error", nameof(HandleDataStreamAsync), nameof(TryWriteDataMessageAsync));
+								_logger.LogError(exception, "{Source} - {InnerSource} error", nameof(HandleDataStreamAsync), nameof(TryWriteDataMessageAsync));
 							else
 								_logger.LogTrace("Wrote {Length} bytes to the data channel of client {Destination}", message.Length, destination.Id);
 						}
@@ -282,7 +312,7 @@ public sealed class RtcClient : IAsyncDisposable, IRtcClient {
 
 		_linkedCts.Dispose();
 
-		_logger.LogDebug("Aborted and disposed the streams of client {Id}", Id);
+		_logger.LogDebug("Aborted and disposed streams");
 	}
 
 	public ValueTask DisposeAsync() {
