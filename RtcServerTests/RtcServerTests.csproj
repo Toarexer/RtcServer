@@ -20,7 +20,7 @@
   </ItemGroup>
 
   <ItemGroup>
-    <ProjectReference Include="..\RtcServer\RtcServer.csproj" />
+    <ProjectReference Include="..\RtcServer\RtcServer.csproj"/>
   </ItemGroup>
 
 </Project>

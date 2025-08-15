@@ -190,11 +190,11 @@ public sealed class Server : IDisposable {
 
 		WebApplication app = builder.Build();
 		app.MapPost("/auth/allow-all", () => Results.Ok());
-		app.MapGet("/info/app", () => Results.Json(appInfo, _config.GlobalSerializerOptions));
-		app.MapGet("/info/config", () => Results.Json(_config, _config.GlobalSerializerOptions));
-		app.MapGet("/info/store", () => Results.Json(_store.GetStoreInfo(), _config.GlobalSerializerOptions));
-		app.MapGet("/info/clients", () => Results.Json(_store.GetClientInfos(), _config.GlobalSerializerOptions));
-		app.MapGet("/info", () => Results.Json(new AllInfo<RtcClient>(appInfo, _config, _store.GetStoreInfo(), _store.GetClientInfos()), _config.GlobalSerializerOptions));
+		app.MapGet("/info/app", () => Results.Json(appInfo, Config.SerializerOptions));
+		app.MapGet("/info/config", () => Results.Json(_config, Config.SerializerOptions));
+		app.MapGet("/info/store", () => Results.Json(_store.GetStoreInfo(), Config.SerializerOptions));
+		app.MapGet("/info/clients", () => Results.Json(_store.GetClientInfos(), Config.SerializerOptions));
+		app.MapGet("/info", () => Results.Json(new AllInfo<RtcClient>(appInfo, _config, _store.GetStoreInfo(), _store.GetClientInfos()), Config.SerializerOptions));
 
 		return app;
 	}

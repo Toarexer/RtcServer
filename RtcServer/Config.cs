@@ -16,15 +16,12 @@ public record Config(int QuicPort, int HttpPort, string AuthorizationUri, LogLev
 	private const string AuthorizationUriEnv = "RTC_SERVER_AUTH_URI";
 	private const string LogLevelEnv         = "RTC_SERVER_LOG_LEVEL";
 
-	private static readonly JsonSerializerOptions SerializerOptions = new() {
+	public static readonly JsonSerializerOptions SerializerOptions = new() {
 		IndentCharacter = '\t',
 		IndentSize = 1,
 		NewLine = "\n",
 		WriteIndented = true
 	};
-
-	/// <summary>Returns the <see cref="JsonSerializerOptions"/> used by all <see cref="Config"/> instances.</summary>
-	public JsonSerializerOptions GlobalSerializerOptions => SerializerOptions;
 
 	/// <summary>Writes this configuration into a json file.</summary>
 	/// <param name="configFile">The json file to write the server configuration to.</param>
